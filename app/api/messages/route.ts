@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { appendMessage, listMessages } from "@/lib/store";
+import { appendMessage, listMessagesAfter } from "@/lib/store";
 import {
   authErrorResponse,
+  bearerMayPostAs,
   configErrorResponse,
   getApiToken,
   getRoomKey,
+  identifyBearer,
   isAuthorizedForMessages,
   isValidBearer,
   isValidRoomKey,
@@ -28,20 +30,18 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const limit = Number(url.searchParams.get("limit") ?? "50");
   const after = url.searchParams.get("after");
-  let messages;
+  let page;
   try {
-    messages = await listMessages(Number.isFinite(limit) ? limit : 50);
+    // Server-side cursor: applied against full history before the limit,
+    // so polling can never silently miss or re-read messages.
+    page = await listMessagesAfter(after, Number.isFinite(limit) ? limit : 50);
   } catch {
     return NextResponse.json(
       { error: "Storage temporarily unavailable. Please retry — nothing was lost." },
       { status: 503 },
     );
   }
-  if (after) {
-    const idx = messages.findIndex((m) => m.id === after);
-    if (idx >= 0) messages = messages.slice(idx + 1);
-  }
-  return NextResponse.json({ messages });
+  return NextResponse.json(page);
 }
 
 export async function POST(req: Request) {
@@ -63,13 +63,26 @@ export async function POST(req: Request) {
   }
   const { sender, text } = parsed.data;
   // Human UI (room key) may only post as You. AI agents (Bearer) may
-  // post as ChatGPT or Muse — or as You only if they hold the token.
-  const viaBearer = isValidBearer(req);
+  // post as ChatGPT or Muse — a per-AI token only as its own AI, so one
+  // AI can never impersonate the other.
+  const viaBearer = isValidBearer(req) || identifyBearer(req) !== null;
   const viaRoomKey = isValidRoomKey(req);
   if (!viaBearer && !viaRoomKey) return authErrorResponse();
   if (viaRoomKey && !viaBearer && sender !== "You") {
     return NextResponse.json(
       { error: "Room-key sessions may only post as You." },
+      { status: 403 },
+    );
+  }
+  if (viaBearer && sender !== "You" && !bearerMayPostAs(req, sender)) {
+    const identity = identifyBearer(req);
+    return NextResponse.json(
+      {
+        error:
+          identity && identity !== "api"
+            ? `This token belongs to ${identity}; it cannot post as ${sender}.`
+            : "This token cannot post as the requested sender.",
+      },
       { status: 403 },
     );
   }

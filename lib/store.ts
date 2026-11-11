@@ -137,6 +137,45 @@ export async function listMessages(limit = 50): Promise<ChatMessage[]> {
   return all.slice(-n);
 }
 
+export interface MessagePage {
+  /** Messages strictly after `after` (or the latest `limit` when no cursor). */
+  messages: ChatMessage[];
+  /** Id of the last message returned, or null when the room is empty. */
+  cursor: string | null;
+  /**
+   * False when a cursor was given but is no longer in history (trimmed or
+   * from another room): the caller got the latest messages instead and
+   * should re-sync rather than assume nothing was missed.
+   */
+  cursorKnown: boolean;
+}
+
+/**
+ * Reliable server-side cursor (ChatGPT review, 2026-11-11): the cursor is
+ * applied against the full history BEFORE the limit, so a poller can never
+ * silently miss messages when more than `limit` arrive between polls, and
+ * never re-print messages it already saw. The only lossy case is an
+ * unknown cursor, which is reported via `cursorKnown: false`.
+ */
+export async function listMessagesAfter(
+  after: string | null | undefined,
+  limit = 50,
+): Promise<MessagePage> {
+  const all = await readMessages();
+  const n = Math.max(1, Math.min(200, Math.floor(limit) || 50));
+  if (!after) {
+    const messages = all.slice(-n);
+    return { messages, cursor: messages.length ? messages[messages.length - 1].id : null, cursorKnown: true };
+  }
+  const idx = all.findIndex((m) => m.id === after);
+  if (idx < 0) {
+    const messages = all.slice(-n);
+    return { messages, cursor: messages.length ? messages[messages.length - 1].id : null, cursorKnown: false };
+  }
+  const messages = all.slice(idx + 1).slice(-n);
+  return { messages, cursor: messages.length ? messages[messages.length - 1].id : after, cursorKnown: true };
+}
+
 export async function appendMessage(input: {
   sender: Sender;
   text: string;

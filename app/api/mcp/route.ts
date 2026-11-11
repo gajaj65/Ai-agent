@@ -1,7 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { appendMessage, listMessages, roomInfo } from "@/lib/store";
-import { configErrorResponse, getMcpToken, isValidMcpBearer } from "@/lib/auth";
+import { appendMessage, listMessagesAfter, roomInfo } from "@/lib/store";
+import {
+  bearerMayPostAs,
+  configErrorResponse,
+  getMcpToken,
+  identifyBearer,
+  isValidMcpBearer,
+} from "@/lib/auth";
 import { MAX_TEXT_LENGTH, SENDERS } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -30,11 +36,13 @@ const TOOLS = [
   },
   {
     name: "read_messages",
-    description: "Retrieve recent messages from the shared Threeway chat room.",
+    description:
+      "Retrieve messages from the shared Threeway chat room. Pass `after` with the id of the last message you saw to get only newer messages; the reply carries a `cursor` (last message id) and `cursorKnown` (false when your cursor is no longer in history — re-sync then).",
     inputSchema: {
       type: "object",
       properties: {
         limit: { type: "number", minimum: 1, maximum: 200, default: 50 },
+        after: { type: "string", description: "Message id to read after (exclusive cursor)." },
       },
       required: [],
       additionalProperties: false,
@@ -56,7 +64,10 @@ const sendSchema = z.object({
   sender: z.enum(["ChatGPT", "Muse"]),
   text: z.string().trim().min(1).max(MAX_TEXT_LENGTH),
 });
-const readSchema = z.object({ limit: z.number().int().min(1).max(200).default(50) });
+const readSchema = z.object({
+  limit: z.number().int().min(1).max(200).default(50),
+  after: z.string().optional(),
+});
 
 function rpcError(id: unknown, code: number, message: string) {
   return NextResponse.json({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
@@ -120,14 +131,26 @@ export async function POST(req: Request) {
       if (name === "send_message") {
         const parsed = sendSchema.safeParse(args);
         if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for send_message.");
+        // The Bearer token decides the identity: a per-AI token may only
+        // post as its own AI, so one AI can never impersonate the other.
+        if (!bearerMayPostAs(req, parsed.data.sender)) {
+          const identity = identifyBearer(req);
+          return rpcError(
+            rpc.id,
+            -32602,
+            identity && identity !== "api"
+              ? `This token belongs to ${identity}; it cannot post as ${parsed.data.sender}.`
+              : "This token cannot post as the requested sender.",
+          );
+        }
         const message = await appendMessage({ ...parsed.data, source: "mcp" });
         return toolText(rpc.id, { message });
       }
       if (name === "read_messages") {
         const parsed = readSchema.safeParse(args);
         if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for read_messages.");
-        const messages = await listMessages(parsed.data.limit);
-        return toolText(rpc.id, { messages });
+        const page = await listMessagesAfter(parsed.data.after, parsed.data.limit);
+        return toolText(rpc.id, page);
       }
       if (name === "room_info") {
         return toolText(rpc.id, await roomInfo());

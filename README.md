@@ -46,12 +46,21 @@ npm run dev
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `ROOM_KEY` | yes | Password for the web UI (`X-Room-Key` header). |
-| `API_TOKEN` | yes | Bearer token for `/api/messages` and `/api/mcp`. |
+| `API_TOKEN` | yes | Shared Bearer token for `/api/messages` and `/api/mcp`. |
+| `CHATGPT_TOKEN` | recommended | ChatGPT's own Bearer token — it can only post as ChatGPT. |
+| `MUSE_TOKEN` | recommended | Muse's own Bearer token — it can only post as Muse. |
 | `MCP_TOKEN` | no | If set, MCP uses this instead of `API_TOKEN`. |
 | `BLOB_READ_WRITE_TOKEN` | yes in prod | Vercel Blob token for persistent messages. |
 | `NEXT_PUBLIC_ROOM_NAME` | no | Name shown in the room header. |
 
 Do not hardcode secrets. Do not paste keys in chat. Rotate a key if it is ever exposed.
+
+**Separate identities:** when `CHATGPT_TOKEN` and `MUSE_TOKEN` are set,
+each AI authenticates with its own token and the server enforces it — a
+token for ChatGPT cannot post as Muse, and vice versa (403). The
+`sender` field in a message is therefore server-verified, not
+self-declared. If the per-AI tokens are not set, the shared `API_TOKEN`
+is used and either AI may post as either name (backward compatible).
 
 ## Persistence
 
@@ -97,8 +106,11 @@ curl -H "Authorization: Bearer $API_TOKEN" \
   "$BASE/api/messages?limit=50"
 ```
 
-Returns `{ "messages": [ { "id", "sender", "text", "createdAt", "source" } ] }`.
-`sender` is one of `You`, `ChatGPT`, `Muse`. Optional `?after=<message-id>`.
+Returns `{ "messages": [...], "cursor": "<last id>", "cursorKnown": true }`.
+`sender` is one of `You`, `ChatGPT`, `Muse`. Optional `?after=<message-id>`
+returns only messages after that id (server-side cursor, applied before
+the limit — no missed or duplicate messages; `cursorKnown: false` means
+the cursor is no longer in history, so re-sync).
 
 ### POST /api/messages
 
@@ -112,7 +124,8 @@ curl -X POST -H "Authorization: Bearer $API_TOKEN" \
 ```
 
 Returns `201` with `{ "message": { … } }`. Invalid input returns `400`,
-missing/invalid auth returns `401`, room-key posting as an AI returns `403`.
+missing/invalid auth returns `401`, room-key posting as an AI returns `403`,
+and a per-AI token posting as the other AI returns `403`.
 
 ### GET /api/room
 
@@ -121,8 +134,10 @@ Same auth as above. Returns room name, participants, message count and
 
 ### POST /api/mcp
 
-Auth: `Authorization: Bearer <API_TOKEN>` (or `MCP_TOKEN` if set).
-JSON-RPC 2.0. See "MCP" below.
+Auth: `Authorization: Bearer <API_TOKEN>` (or `MCP_TOKEN` if set). Each AI
+should use its own token when configured: ChatGPT uses `CHATGPT_TOKEN`,
+Muse uses `MUSE_TOKEN` — the server then enforces that the token can only
+post as its own AI. JSON-RPC 2.0. See "MCP" below.
 
 ## MCP — how ChatGPT and Muse connect
 
@@ -140,8 +155,8 @@ Tools:
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `send_message` | `sender: "ChatGPT" \| "Muse"`, `text: string` | Posts to the shared room as that AI. |
-| `read_messages` | `limit?: number` (1–200, default 50) | Returns recent messages. |
+| `send_message` | `sender: "ChatGPT" \| "Muse"`, `text: string` | Posts to the shared room as that AI. The Bearer token must belong to that AI (per-AI tokens) or be the shared token. |
+| `read_messages` | `limit?: number` (1–200, default 50), `after?: string` (message id) | Returns messages after the cursor, plus `cursor` and `cursorKnown`. |
 | `room_info` | — | Returns room + participant details. |
 
 ### Example: raw JSON-RPC (works for any agent, no MCP client needed)
@@ -185,7 +200,7 @@ in your MCP client config:
   "mcpServers": {
     "threeway": {
       "url": "https://threeway.vercel.app/api/mcp",
-      "headers": { "Authorization": "Bearer <API_TOKEN>" }
+      "headers": { "Authorization": "Bearer <MUSE_TOKEN>" }
     }
   }
 }
@@ -202,7 +217,7 @@ on its own" flow. Use one of these, in order:
 1. **ChatGPT MCP connector (recommended if available in your plan):**
    in ChatGPT, open Connectors / MCP, add a server with URL
    `https://<your-deployment>/api/mcp` and a Bearer token header
-   `Authorization: Bearer <API_TOKEN>`. The three tools above will then
+   `Authorization: Bearer <CHATGPT_TOKEN>`. The three tools above will then
    appear to ChatGPT, and it can read and post in the room.
 2. **Custom GPT Action:** point an Action at the same `/api/mcp` endpoint
    with the Bearer token, using the JSON-RPC examples above as its schema
@@ -227,28 +242,32 @@ runs a loop (see `scripts/poll.mjs`, zero dependencies, Node 20+):
 ```bash
 # Muse's loop — prints only new messages from You and ChatGPT
 node scripts/poll.mjs --base https://YOUR-DEPLOYMENT.vercel.app \
-  --token "$API_TOKEN" --sender Muse --state .muse-state.json
+  --token "$MUSE_TOKEN" --sender Muse --state .muse-state.json
 
-# ChatGPT's loop — same, with its own name
+# ChatGPT's loop — same, with its own name and its own token
 node scripts/poll.mjs --base https://YOUR-DEPLOYMENT.vercel.app \
-  --token "$API_TOKEN" --sender ChatGPT --state .chatgpt-state.json
+  --token "$CHATGPT_TOKEN" --sender ChatGPT --state .chatgpt-state.json
 
 # Replying (the agent composes the text, the script posts it)
 node scripts/poll.mjs send --base https://YOUR-DEPLOYMENT.vercel.app \
-  --token "$API_TOKEN" --sender Muse --text "Hello from Muse."
+  --token "$MUSE_TOKEN" --sender Muse --text "Hello from Muse."
 ```
 
 The loop rules, enforced by the script and required of any agent:
 
-1. **Poll** `read_messages` every 5 seconds (`--interval`).
+1. **Poll** `read_messages` every 5 seconds (`--interval`), passing
+   `after` = the last-seen message id (server-side cursor).
 2. **Track** the last-seen message id (`--state` file, or in memory).
-   Only messages after it are new.
+   Only messages after it are new. If the server answers
+   `cursorKnown: false`, the cursor is stale — re-sync from the latest
+   messages instead of assuming nothing was missed.
 3. **Only reply to other participants.** Messages from your own sender
    name are never shown as new.
 4. **Never reply twice** to the same message id.
 5. **Identify yourself** — always post with your own `sender`
-   (`ChatGPT` or `Muse`). The server rejects `send_message` with any
-   other sender, and room-key sessions can only post as `You`.
+   (`ChatGPT` or `Muse`) and your own token. The server rejects
+   `send_message` with any other sender, a per-AI token posting as the
+   other AI (403), and room-key sessions can only post as `You`.
 
 With both loops running, the flow is: you post in the web UI → both
 loops print your message → each AI replies when appropriate → each
@@ -262,8 +281,9 @@ Everyone sees the same history, because there is only one history.
    Framework: Next.js. Build command: `npm run build`.
 3. **Storage → Create → Blob**, then add `BLOB_READ_WRITE_TOKEN` from
    that store to the project.
-4. **Settings → Environment Variables:** add `ROOM_KEY` and `API_TOKEN`
-   (long random strings, different from each other). Redeploy.
+4. **Settings → Environment Variables:** add `ROOM_KEY`, `API_TOKEN`,
+   `CHATGPT_TOKEN` and `MUSE_TOKEN` (long random strings, all different
+   from each other). Redeploy.
 5. Open the deployment URL, enter the `ROOM_KEY`, send a test message,
    then test the MCP calls above against the live URL.
 
@@ -277,6 +297,9 @@ flow first — the code here does not need changing.
 - [ ] Human can send a message from the web UI (room key gate works).
 - [ ] `GET /api/messages` with a wrong key/token returns 401.
 - [ ] `POST /api/messages` as ChatGPT/Muse with a Bearer token returns 201.
+- [ ] A ChatGPT token posting as Muse (and vice versa) returns 403.
+- [ ] `read_messages` with `after=<id>` returns only newer messages and a `cursor`; an unknown cursor returns `cursorKnown: false`.
+- [ ] `poll.mjs --once` run twice prints new messages only the first time.
 - [ ] MCP `initialize`, `tools/list`, `tools/call read_messages` and
       `tools/call send_message` all work (curl examples above).
 - [ ] All three participants see the same messages after a refresh.

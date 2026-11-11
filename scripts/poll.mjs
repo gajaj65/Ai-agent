@@ -72,12 +72,20 @@ async function mcp(method, params = {}) {
   return body.result;
 }
 
-async function readMessages(limit = 50) {
+async function readMessages(limit = 50, after = null) {
+  const args = { limit };
+  if (after) args.after = after; // server-side cursor: no missed or duplicate messages
   const result = await mcp("tools/call", {
     name: "read_messages",
-    arguments: { limit },
+    arguments: args,
   });
-  return result.structuredContent?.messages ?? [];
+  const page = result.structuredContent ?? {};
+  // Older servers return a bare { messages } array; new ones return a page.
+  return {
+    messages: page.messages ?? [],
+    cursor: page.cursor ?? null,
+    cursorKnown: page.cursorKnown ?? true,
+  };
 }
 
 async function sendMessage(text) {
@@ -131,15 +139,20 @@ async function tick() {
       console.log(`[${sender}] Connected to ${base} (MCP ${init.protocolVersion}). Watching for new messages…`);
       initialized = true;
     }
-    const messages = await readMessages();
-    // New = everything after lastSeenId (or everything, on first run).
+    const { messages, cursor, cursorKnown } = await readMessages(50, lastSeenId);
+    if (lastSeenId && !cursorKnown) {
+      console.log(`[${sender}] Cursor no longer in history — re-synced from the latest messages.`);
+    }
+    // The server already applied the cursor, so everything returned is new.
+    // (Client-side slicing stays as a fallback for older servers that
+    // return a bare message list without a cursor.)
     let fresh = messages;
-    if (lastSeenId) {
+    if (!cursor && lastSeenId) {
       const idx = messages.findIndex((m) => m.id === lastSeenId);
       fresh = idx >= 0 ? messages.slice(idx + 1) : messages;
     }
     if (messages.length) {
-      lastSeenId = messages[messages.length - 1].id;
+      lastSeenId = cursor ?? messages[messages.length - 1].id;
       await saveState({ lastSeenId });
     }
     // Rule: only other participants, never your own messages, never twice.
