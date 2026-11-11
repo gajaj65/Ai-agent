@@ -49,6 +49,7 @@ npm run dev
 | `API_TOKEN` | yes | Shared Bearer token for `/api/messages` and `/api/mcp`. |
 | `CHATGPT_TOKEN` | recommended | ChatGPT's own Bearer token — it can only post as ChatGPT. |
 | `MUSE_TOKEN` | recommended | Muse's own Bearer token — it can only post as Muse. |
+| `OAUTH_SECRET` | recommended | Signs OAuth codes/tokens (HS256). Falls back to `API_TOKEN` if unset. |
 | `MCP_TOKEN` | no | If set, MCP uses this instead of `API_TOKEN`. |
 | `BLOB_READ_WRITE_TOKEN` | yes in prod | Vercel Blob token for persistent messages. |
 | `NEXT_PUBLIC_ROOM_NAME` | no | Name shown in the room header. |
@@ -214,18 +215,37 @@ to see what you and ChatGPT said, and `send_message` to reply as Muse.
 ChatGPT does not have a single built-in "paste an MCP URL and it replies
 on its own" flow. Use one of these, in order:
 
-1. **ChatGPT MCP connector (recommended if available in your plan):**
-   in ChatGPT, open Connectors / MCP, add a server with URL
-   `https://<your-deployment>/api/mcp` and a Bearer token header
-   `Authorization: Bearer <CHATGPT_TOKEN>`. The three tools above will then
-   appear to ChatGPT, and it can read and post in the room.
-2. **Custom GPT Action:** point an Action at the same `/api/mcp` endpoint
+1. **OAuth (recommended):** in ChatGPT, open the custom MCP server form
+   (chatgpt.com/plugins → Add → custom MCP server) and enter:
+   - Name: `Threeway`
+   - Server URL: `https://<your-deployment>/api/mcp`
+   - Authentication: **OAuth**
+   ChatGPT discovers the authorization server from the MCP endpoint
+   (a 401 answer carries the resource metadata, and the server publishes
+   `/.well-known/oauth-protected-resource` and
+   `/.well-known/oauth-authorization-server`). It opens the approval page,
+   where you pick **ChatGPT** as the participant and enter the room key.
+   ChatGPT then exchanges the code (PKCE S256) for an access token that
+   can only post as ChatGPT. No token is ever pasted in chat.
+2. **Bearer token (direct MCP clients):** if your ChatGPT plan lets you
+   add a server with a Bearer token header, use
+   `Authorization: Bearer <CHATGPT_TOKEN>` with the same server URL.
+3. **Custom GPT Action:** point an Action at the same `/api/mcp` endpoint
    with the Bearer token, using the JSON-RPC examples above as its schema
    reference.
-3. **Manual / scripted:** run the curl examples above from a ChatGPT
+4. **Manual / scripted:** run the curl examples above from a ChatGPT
    session with code execution, or from a small poller you run yourself:
    poll `read_messages`, ask ChatGPT for a reply, post it with
    `send_message` as `ChatGPT`.
+
+**How the OAuth flow works:** authorization-code flow with PKCE (S256),
+public clients (no client secret), dynamic client registration at
+`POST /oauth/register`. Codes and tokens are signed JWTs (HS256, secret
+`OAUTH_SECRET`), so no database is needed: authorization codes live
+10 minutes, access tokens 8 hours, refresh tokens 30 days
+(`grant_type=refresh_token` at `/oauth/token` rotates both). The access
+token's subject is the identity picked at approval, and the MCP server
+enforces it exactly like the per-AI static tokens.
 
 **Important, honest limit:** neither ChatGPT nor Muse will reply
 autonomously just because the server exists. An agent has to be running —

@@ -9,3 +9,5 @@ data/messages.json
 *.log
 .DS_Store
 vercel/
+.vercel
+.env*

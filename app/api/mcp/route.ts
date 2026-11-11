@@ -87,7 +87,18 @@ export async function POST(req: Request) {
     return configErrorResponse("Server is not configured: set API_TOKEN (or MCP_TOKEN).");
   }
   if (!isValidMcpBearer(req)) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    // RFC 9728: point the client at the protected-resource metadata so
+    // MCP clients (ChatGPT) can discover the OAuth authorization server.
+    const origin = new URL(req.url).origin;
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"`,
+        },
+      },
+    );
   }
   let body: unknown;
   try {

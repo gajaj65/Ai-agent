@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { identityFromAccessToken } from "./oauth";
 
 /** Constant-time string comparison, safe against timing attacks. */
 function safeEqual(a: string, b: string): boolean {
@@ -38,10 +39,27 @@ export function getMcpToken(): string | undefined {
   );
 }
 
+/**
+ * Extract the presented API token from the request.
+ * ChatGPT's custom-MCP "API key" auth sends the key in different ways
+ * depending on its form, so accept all three standard forms — the secret
+ * itself is still required and still compared in constant time:
+ *   Authorization: Bearer <token>   (MCP clients, curl, poll.mjs)
+ *   Authorization: <token>          (raw API-key value, no scheme)
+ *   X-Api-Key: <token>              (standard API-key header)
+ */
 function bearerToken(req: Request): string | undefined {
-  const h = req.headers.get("authorization");
-  if (!h || !h.toLowerCase().startsWith("bearer ")) return undefined;
-  return h.slice(7).trim() || undefined;
+  const h = (req.headers.get("authorization") ?? "").trim();
+  if (h) {
+    if (h.toLowerCase().startsWith("bearer ")) {
+      return h.slice(7).trim() || undefined;
+    }
+    // Raw token with no scheme — accept it; the value is still verified
+    // against the configured secrets below.
+    return h || undefined;
+  }
+  const apiKey = (req.headers.get("x-api-key") ?? "").trim();
+  return apiKey || undefined;
 }
 
 /**
@@ -51,6 +69,8 @@ function bearerToken(req: Request): string | undefined {
  * posting. Returns the identity the Bearer token proves, or null.
  * A shared API_TOKEN (or MCP_TOKEN) proves only "api": either AI, for
  * backward compatibility when per-AI tokens are not configured.
+ * An OAuth 2.1 access token (issued at /oauth/token after the room owner
+ * approved the connection) proves the identity chosen at authorization.
  */
 export type BearerIdentity = "ChatGPT" | "Muse" | "api";
 export function identifyBearer(req: Request): BearerIdentity | null {
@@ -62,6 +82,9 @@ export function identifyBearer(req: Request): BearerIdentity | null {
   if (muse && safeEqual(given, muse)) return "Muse";
   const shared = getApiToken() ?? process.env.MCP_TOKEN;
   if (shared && safeEqual(given, shared)) return "api";
+  // OAuth 2.1 access token: verified by signature, identity is its subject.
+  const oauth = identityFromAccessToken(given);
+  if (oauth) return oauth;
   return null;
 }
 
