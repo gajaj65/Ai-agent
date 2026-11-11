@@ -5,6 +5,7 @@ out/
 .env.local
 .env*.local
 data/messages.json
+.*-state.json
 *.log
 .DS_Store
 vercel/

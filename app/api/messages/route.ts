@@ -28,7 +28,15 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const limit = Number(url.searchParams.get("limit") ?? "50");
   const after = url.searchParams.get("after");
-  let messages = await listMessages(Number.isFinite(limit) ? limit : 50);
+  let messages;
+  try {
+    messages = await listMessages(Number.isFinite(limit) ? limit : 50);
+  } catch {
+    return NextResponse.json(
+      { error: "Storage temporarily unavailable. Please retry — nothing was lost." },
+      { status: 503 },
+    );
+  }
   if (after) {
     const idx = messages.findIndex((m) => m.id === after);
     if (idx >= 0) messages = messages.slice(idx + 1);
@@ -65,10 +73,18 @@ export async function POST(req: Request) {
       { status: 403 },
     );
   }
-  const message = await appendMessage({
-    sender,
-    text,
-    source: viaBearer ? "api" : "web",
-  });
+  let message;
+  try {
+    message = await appendMessage({
+      sender,
+      text,
+      source: viaBearer ? "api" : "web",
+    });
+  } catch {
+    return NextResponse.json(
+      { error: "Storage temporarily unavailable. Message was not saved — please retry." },
+      { status: 503 },
+    );
+  }
   return NextResponse.json({ message }, { status: 201 });
 }

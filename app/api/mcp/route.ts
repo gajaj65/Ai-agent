@@ -7,6 +7,12 @@ import { MAX_TEXT_LENGTH, SENDERS } from "@/lib/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+/** MCP protocol versions this server speaks. initialize() negotiates:
+ *  the client's requested version is used when supported, otherwise the
+ *  oldest supported version is returned (ChatGPT review, 2026-11-11). */
+const SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"] as const;
+const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
+
 const TOOLS = [
   {
     name: "send_message",
@@ -92,9 +98,15 @@ export async function POST(req: Request) {
   }
 
   if (method === "initialize") {
+    const requested = params.protocolVersion as string | undefined;
+    const protocolVersion = (SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(
+      requested ?? "",
+    )
+      ? requested!
+      : DEFAULT_PROTOCOL_VERSION;
     return rpcResult(rpc.id, {
-      protocolVersion: "2024-11-05",
-      capabilities: { tools: {} },
+      protocolVersion,
+      capabilities: { tools: { listChanged: false } },
       serverInfo: { name: "threeway-mcp", version: "1.0.0" },
     });
   }
@@ -104,20 +116,25 @@ export async function POST(req: Request) {
   if (method === "tools/call") {
     const name = params.name as string | undefined;
     const args = (params.arguments ?? {}) as Record<string, unknown>;
-    if (name === "send_message") {
-      const parsed = sendSchema.safeParse(args);
-      if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for send_message.");
-      const message = await appendMessage({ ...parsed.data, source: "mcp" });
-      return toolText(rpc.id, { message });
-    }
-    if (name === "read_messages") {
-      const parsed = readSchema.safeParse(args);
-      if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for read_messages.");
-      const messages = await listMessages(parsed.data.limit);
-      return toolText(rpc.id, { messages });
-    }
-    if (name === "room_info") {
-      return toolText(rpc.id, await roomInfo());
+    try {
+      if (name === "send_message") {
+        const parsed = sendSchema.safeParse(args);
+        if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for send_message.");
+        const message = await appendMessage({ ...parsed.data, source: "mcp" });
+        return toolText(rpc.id, { message });
+      }
+      if (name === "read_messages") {
+        const parsed = readSchema.safeParse(args);
+        if (!parsed.success) return rpcError(rpc.id, -32602, "Invalid params for read_messages.");
+        const messages = await listMessages(parsed.data.limit);
+        return toolText(rpc.id, { messages });
+      }
+      if (name === "room_info") {
+        return toolText(rpc.id, await roomInfo());
+      }
+    } catch {
+      // Storage failure: report it, never pretend the call succeeded.
+      return rpcError(rpc.id, -32603, "Internal error: storage temporarily unavailable.");
     }
     return rpcError(rpc.id, -32602, `Unknown tool: ${name ?? "(missing)"}.`);
   }

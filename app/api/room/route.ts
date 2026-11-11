@@ -10,5 +10,12 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Server is not configured." }, { status: 503 });
   }
   if (!isAuthorizedForMessages(req)) return authErrorResponse();
-  return NextResponse.json(await roomInfo());
+  try {
+    return NextResponse.json(await roomInfo());
+  } catch {
+    return NextResponse.json(
+      { error: "Storage temporarily unavailable. Please retry." },
+      { status: 503 },
+    );
+  }
 }

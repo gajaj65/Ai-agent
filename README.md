@@ -55,21 +55,34 @@ Do not hardcode secrets. Do not paste keys in chat. Rotate a key if it is ever e
 
 ## Persistence
 
-Messages are stored in **Vercel Blob** (`threeway/messages.json`, private)
-when `BLOB_READ_WRITE_TOKEN` is set. That is the production path: messages
-survive redeployment, and the browser never stores messages in localStorage
-(the room key is kept in `sessionStorage` only, and only for the session).
+Messages are stored in **Vercel Blob** (`threeway/messages/<createdAt>-<id>.json`,
+private) when `BLOB_READ_WRITE_TOKEN` is set — **one object per message**.
+That is the production path: messages survive redeployment, and the browser
+never stores messages in localStorage (the room key is kept in
+`sessionStorage` only, and only for the session).
+
+Two reliability rules, added after a ChatGPT code review (2026-11-11):
+
+1. **A failed read never returns an empty list.** "Not found" means empty;
+   any other storage failure throws, and the API answers 503 ("nothing was
+   lost, please retry") instead of writing over the history.
+2. **Appending never reads first.** Each message is a new Blob object, so
+   two Vercel instances posting at the same time cannot overwrite each
+   other — there is no read-modify-write in Blob mode. A single unreadable
+   message is skipped on read, never the whole history. Messages written
+   by v1 (one `threeway/messages.json` file) are still read, so nothing
+   is lost by upgrading.
 
 Without a Blob token the app falls back to `data/messages.json` on disk.
 That is for local development only — Vercel's filesystem is ephemeral, so
-messages would not survive a redeploy in that mode. The room header shows
-`storage: blob` or `storage: file` so you can see which mode is live.
+messages would not survive a redeploy in that mode, and the file fallback
+still uses read-modify-write (serialised by a mutex, aborting the write
+if the read fails). The room header shows `storage: blob` or
+`storage: file` so you can see which mode is live.
 
-Writes are serialised with an in-process mutex so two simultaneous
-messages on one server instance cannot overwrite each other. Blob itself
-is last-write-wins across Vercel instances; for very high concurrency,
-swap `lib/store.ts` for a real database (for example Supabase Postgres)
-behind the same `readMessages` / `appendMessage` interface.
+For very high concurrency, swap `lib/store.ts` for a real database (for
+example Supabase Postgres) behind the same `readMessages` /
+`appendMessage` interface.
 
 ## API
 
@@ -115,7 +128,9 @@ JSON-RPC 2.0. See "MCP" below.
 
 The MCP server lives at `POST /api/mcp`. It implements JSON-RPC 2.0:
 
-- `initialize` → protocol `2024-11-05`, `serverInfo: threeway-mcp 1.0.0`
+- `initialize` → negotiates the protocol version: the client's requested
+  version is used when it is one of `2024-11-05`, `2025-03-26` or
+  `2025-06-18`, otherwise `2024-11-05` is returned. `serverInfo: threeway-mcp 1.0.0`
 - `tools/list` → `send_message`, `read_messages`, `room_info`
 - `tools/call` → executes a tool, returns `content` + `structuredContent`
 - `ping` → `{}`
@@ -203,6 +218,42 @@ a ChatGPT session with the connector on, a Muse session, or a scheduled
 worker — that polls `read_messages` and calls `send_message`. This app
 provides the shared room and the tools for that; it does not (and cannot,
 without your OpenAI key) make ChatGPT reply by itself.
+
+## Continuous communication — the agent loop
+
+The room supports continuous conversation, not just manual posts. Each AI
+runs a loop (see `scripts/poll.mjs`, zero dependencies, Node 20+):
+
+```bash
+# Muse's loop — prints only new messages from You and ChatGPT
+node scripts/poll.mjs --base https://YOUR-DEPLOYMENT.vercel.app \
+  --token "$API_TOKEN" --sender Muse --state .muse-state.json
+
+# ChatGPT's loop — same, with its own name
+node scripts/poll.mjs --base https://YOUR-DEPLOYMENT.vercel.app \
+  --token "$API_TOKEN" --sender ChatGPT --state .chatgpt-state.json
+
+# Replying (the agent composes the text, the script posts it)
+node scripts/poll.mjs send --base https://YOUR-DEPLOYMENT.vercel.app \
+  --token "$API_TOKEN" --sender Muse --text "Hello from Muse."
+```
+
+The loop rules, enforced by the script and required of any agent:
+
+1. **Poll** `read_messages` every 5 seconds (`--interval`).
+2. **Track** the last-seen message id (`--state` file, or in memory).
+   Only messages after it are new.
+3. **Only reply to other participants.** Messages from your own sender
+   name are never shown as new.
+4. **Never reply twice** to the same message id.
+5. **Identify yourself** — always post with your own `sender`
+   (`ChatGPT` or `Muse`). The server rejects `send_message` with any
+   other sender, and room-key sessions can only post as `You`.
+
+With both loops running, the flow is: you post in the web UI → both
+loops print your message → each AI replies when appropriate → each
+loop prints the other's reply → you see both replies in the web UI.
+Everyone sees the same history, because there is only one history.
 
 ## Vercel deployment
 
